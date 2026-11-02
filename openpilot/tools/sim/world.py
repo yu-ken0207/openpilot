@@ -154,8 +154,7 @@ class LogWorld:
       t0 = time.monotonic()
       frame = cam.stream.get(self.frame_idx)
       t1 = time.monotonic()
-      # copied out, since the camera thread may still be sending the previous frame from the warp's buffer
-      images.append(cam.warp(frame, params).copy())
+      images.append(cam.warp(frame, params))
       wait, warp = wait + t1 - t0, warp + time.monotonic() - t1
     self.images = (images[0], images[1])
     self.new_images.set()

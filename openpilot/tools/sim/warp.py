@@ -1,9 +1,14 @@
 import platform
+from typing import Any
 import numpy as np
 import pyray as rl
 
 from openpilot.common.transformations.orientation import rot_from_euler
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+
+GL_PACK_ROW_LENGTH, GL_RGBA, GL_UNSIGNED_BYTE = 0x0D02, 0x1908, 0x1401
+# the camera thread may still be sending the previous frame while the next one renders
+N_BUFFERS = 3
 
 # NV12 chroma sample (i, j) sits at luma pixel (2i + 0.5, 2j + 0.5)
 LUMA_FROM_CHROMA = np.array([[2., 0., 0.5], [0., 2., 0.5], [0., 0., 1.]])
@@ -69,6 +74,8 @@ class Warp:
   raylib falls back to llvmpipe without a GPU. All Warps must be created and called from the thread that called init()."""
   shader: rl.Shader
   locs: dict[str, int]
+  read_pixels: Any
+  pixel_store: Any
 
   @staticmethod
   def init() -> None:
@@ -79,13 +86,17 @@ class Warp:
     Warp.shader = rl.load_shader_from_memory(VERTEX_SHADER, FRAGMENT_SHADER)
     assert rl.is_shader_valid(Warp.shader), "warp shader failed to compile"
     Warp.locs = {k: rl.get_shader_location(Warp.shader, k) for k in ("srcSize", "G", "g", "m", "chroma")}
+    # rlReadTexturePixels allocates a new buffer for every read, so frames are read straight into the VisionIPC layout instead
+    Warp.read_pixels = rl.ffi.cast("void (*)(int, int, int, int, unsigned int, unsigned int, void *)", rl.rl_get_proc_address("glReadPixels"))
+    Warp.pixel_store = rl.ffi.cast("void (*)(unsigned int, int)", rl.rl_get_proc_address("glPixelStorei"))
+    assert Warp.read_pixels != rl.ffi.NULL and Warp.pixel_store != rl.ffi.NULL, "no glReadPixels"
 
   def __init__(self, w: int, h: int):
     self.w, self.h = w, h
-    stride, y_height, _, size = get_nv12_info(w, h)
-    self.buf = np.zeros(size, dtype=np.uint8)
-    self.y = self.buf[:stride * h].reshape(h, stride)[:, :w]
-    self.uv = self.buf[stride * y_height:stride * (y_height + h // 2)].reshape(h // 2, stride)[:, :w]
+    self.stride, y_height, _, size = get_nv12_info(w, h)
+    self.uv_offset = self.stride * y_height
+    self.bufs = [np.zeros(size, dtype=np.uint8) for _ in range(N_BUFFERS)]
+    self.buf_idx = 0
     self.planes = []
     for pw, ph, fmt in ((w, h, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_GRAYSCALE), (w // 2, h // 2, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA)):
       tex = rl.Texture(rl.rl_load_texture(rl.ffi.NULL, pw, ph, fmt, 1), pw, ph, 1, fmt)
@@ -94,15 +105,17 @@ class Warp:
       self.planes.append((tex, rl.load_render_texture(w // 4, ph)))
 
   def __call__(self, nv12: np.ndarray, params) -> np.ndarray:
-    w, h = self.w, self.h
+    w, h, stride = self.w, self.h, self.stride
+    self.buf_idx = (self.buf_idx + 1) % N_BUFFERS
+    buf = self.bufs[self.buf_idx]
     if params is None:
-      self.y[:] = nv12[:w * h].reshape(h, w)
-      self.uv[:] = nv12[w * h:].reshape(h // 2, w)
-      return self.buf
+      buf[:stride * h].reshape(h, stride)[:, :w] = nv12[:w * h].reshape(h, w)
+      buf[self.uv_offset:self.uv_offset + stride * h // 2].reshape(h // 2, stride)[:, :w] = nv12[w * h:].reshape(h // 2, w)
+      return buf
 
     rl.rl_set_blend_factors(1, 0, 0x8006)  # GL_ONE, GL_ZERO, GL_FUNC_ADD: write samples as is
-    for chroma, ((tex, target), data, out, (G, g, m)) in enumerate(zip(self.planes, (nv12[:w * h], nv12[w * h:]), (self.y, self.uv),
-                                                                       (params, chroma_params(*params)), strict=True)):
+    for chroma, ((tex, target), data, offset, (G, g, m)) in enumerate(zip(self.planes, (nv12[:w * h], nv12[w * h:]), (0, self.uv_offset),
+                                                                          (params, chroma_params(*params)), strict=True)):
       rl.rl_update_texture(tex.id, 0, 0, tex.width, tex.height, tex.format, rl.ffi.cast("void *", rl.ffi.from_buffer(data)))
       rl.begin_texture_mode(target)
       rl.begin_shader_mode(self.shader)
@@ -117,7 +130,10 @@ class Warp:
       rl.end_blend_mode()
       rl.end_shader_mode()
       rl.end_texture_mode()
-      pixels = rl.rl_read_texture_pixels(target.texture.id, target.texture.width, target.texture.height, target.texture.format)
-      out[:] = np.frombuffer(rl.ffi.buffer(pixels, out.size), dtype=np.uint8).reshape(out.shape)
-      rl.mem_free(pixels)
-    return self.buf
+      # a texel is 4 bytes of a plane row, so rows land stride // 4 texels apart
+      rl.rl_enable_framebuffer(target.id)
+      self.pixel_store(GL_PACK_ROW_LENGTH, stride // 4)
+      self.read_pixels(0, 0, target.texture.width, target.texture.height, GL_RGBA, GL_UNSIGNED_BYTE, rl.ffi.from_buffer(buf[offset:]))
+      self.pixel_store(GL_PACK_ROW_LENGTH, 0)
+      rl.rl_disable_framebuffer()
+    return buf
